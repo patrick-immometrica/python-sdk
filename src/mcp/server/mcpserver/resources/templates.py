@@ -231,6 +231,10 @@ class ResourceTemplate(BaseModel):
             if isinstance(result, InputRequiredResult):
                 return result
 
+            # Async, so `FunctionResource.read` doesn't hop to a worker thread to return it.
+            async def value() -> Any:
+                return result
+
             return FunctionResource(
                 uri=uri,  # type: ignore
                 name=self.name,
@@ -240,7 +244,7 @@ class ResourceTemplate(BaseModel):
                 icons=self.icons,
                 annotations=self.annotations,
                 meta=self.meta,
-                fn=lambda: result,  # Capture result in closure
+                fn=value,
             )
         except (ResourceError, MCPError):
             raise

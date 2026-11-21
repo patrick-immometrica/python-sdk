@@ -1,7 +1,9 @@
 import json
 import threading
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
+import anyio.to_thread
 import pytest
 from mcp_types import Annotations, ElicitRequest, ElicitRequestFormParams, InputRequiredResult
 from pydantic import BaseModel
@@ -14,6 +16,8 @@ from mcp.server.mcpserver.resources.templates import (
     ResourceSecurity,
     ResourceSecurityError,
 )
+
+T = TypeVar("T")
 
 
 def _make(uri_template: str, security: ResourceSecurity = DEFAULT_RESOURCE_SECURITY) -> ResourceTemplate:
@@ -478,6 +482,38 @@ async def test_sync_fn_runs_in_worker_thread():
     assert isinstance(resource, FunctionResource)
     assert await resource.read() == "hello world"
     assert fn_thread[0] != main_thread
+
+
+async def _greet_async(name: str) -> str:
+    return f"hello {name}"
+
+
+def _greet_sync(name: str) -> str:
+    return f"hello {name}"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("fn", "expected_hops"), [(_greet_async, 0), (_greet_sync, 1)])
+async def test_template_read_hops_to_a_worker_thread_only_to_run_a_sync_function(
+    monkeypatch: pytest.MonkeyPatch, fn: Callable[[str], Any], expected_hops: int
+):
+    """SDK-defined: the template function already produced the value, so reading the
+    resource it builds returns that value without another worker-thread round trip."""
+    hops: list[Callable[..., Any]] = []
+    real_run_sync = anyio.to_thread.run_sync
+
+    async def counting_run_sync(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        hops.append(func)
+        return await real_run_sync(func, *args, **kwargs)
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", counting_run_sync)
+
+    template = ResourceTemplate.from_function(fn=fn, uri_template="test://{name}")
+    resource = await template.create_resource("test://world", {"name": "world"}, Context())
+
+    assert isinstance(resource, FunctionResource)
+    assert await resource.read() == "hello world"
+    assert len(hops) == expected_hops
 
 
 @pytest.mark.anyio
