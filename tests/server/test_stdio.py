@@ -3,9 +3,10 @@ import io
 import os
 import sys
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from io import TextIOWrapper
+from typing import Any, TypeVar
 
 import anyio
 import anyio.to_thread
@@ -25,6 +26,8 @@ from typing_extensions import Buffer
 from mcp.server.mcpserver import MCPServer
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
+
+T = TypeVar("T")
 
 
 @pytest.mark.anyio
@@ -73,6 +76,47 @@ async def test_stdio_server_round_trips_messages_over_injected_streams() -> None
     received_responses = [jsonrpc_message_adapter.validate_json(line.strip()) for line in output_lines]
     assert received_responses[0] == JSONRPCRequest(jsonrpc="2.0", id=3, method="ping")
     assert received_responses[1] == JSONRPCResponse(jsonrpc="2.0", id=4, result={})
+
+
+@pytest.mark.anyio
+async def test_stdio_server_writes_and_flushes_each_message_in_one_worker_thread_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK-defined: an outgoing line is useless until flushed, so the write and the flush share
+    one worker-thread round trip instead of paying for two."""
+    log: list[str] = []
+
+    class RecordingStdout(io.StringIO):
+        def write(self, s: str) -> int:
+            log.append("write")
+            return super().write(s)
+
+        def flush(self) -> None:
+            log.append("flush")
+            super().flush()
+
+    real_run_sync = anyio.to_thread.run_sync
+
+    async def counting_run_sync(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        log.append("hop")
+        return await real_run_sync(func, *args, **kwargs)
+
+    with anyio.fail_after(5):
+        async with stdio_server(stdin=anyio.AsyncFile(io.StringIO()), stdout=anyio.AsyncFile(RecordingStdout())) as (
+            read_stream,
+            write_stream,
+        ):
+            # Let the reader hit stdin EOF first so only the writer's hops are counted.
+            async with read_stream:
+                with pytest.raises(anyio.EndOfStream):
+                    await read_stream.receive()
+            monkeypatch.setattr(anyio.to_thread, "run_sync", counting_run_sync)
+
+            for request_id in (1, 2):
+                await write_stream.send(SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=request_id, method="ping")))
+            await write_stream.aclose()
+
+    assert log == ["hop", "write", "flush", "hop", "write", "flush"]
 
 
 @pytest.mark.anyio

@@ -18,10 +18,11 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from io import TextIOWrapper
-from typing import BinaryIO, Literal, TextIO
+from typing import IO, BinaryIO, Literal, TextIO
 
 import anyio
 import anyio.lowlevel
+import anyio.to_thread
 import mcp_types as types
 
 from mcp.os.win32.utilities import rebind_std_handle_to_fd
@@ -158,6 +159,11 @@ def _claim_fd(
     return os.fdopen(private_fd, mode, closefd=False), release
 
 
+def _write_line(stdout: IO[str], line: str) -> None:
+    stdout.write(line)
+    stdout.flush()
+
+
 @asynccontextmanager
 async def stdio_server(stdin: anyio.AsyncFile[str] | None = None, stdout: anyio.AsyncFile[str] | None = None):
     """Serve MCP over the process's stdin and stdout.
@@ -201,8 +207,8 @@ async def stdio_server(stdin: anyio.AsyncFile[str] | None = None, stdout: anyio.
                 async with write_stream_reader:
                     async for session_message in write_stream_reader:
                         json = session_message.message.model_dump_json(by_alias=True, exclude_unset=True)
-                        await stdout.write(json + "\n")
-                        await stdout.flush()
+                        # One worker-thread hop for both: a write is useless until it is flushed.
+                        await anyio.to_thread.run_sync(_write_line, stdout.wrapped, json + "\n")
             except anyio.ClosedResourceError:  # pragma: no cover
                 await anyio.lowlevel.checkpoint()
 
